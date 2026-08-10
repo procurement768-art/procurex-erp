@@ -1233,6 +1233,7 @@ body{
 <style id="procurex-clean-logo">
 .sidebar .logo::before,.sidebar .logo::after{content:none !important;display:none !important;}
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 </head>
@@ -3245,7 +3246,7 @@ function openTrackingModal(item=null){
         <div class="field" style="grid-column:1/-1;margin-top:12px">
             <label>PDF Document (Purchase Tracking only)</label>
             <input id="trackingPdfFile" class="input" type="file" accept="application/pdf,.pdf">
-            <div style="font-size:12px;color:#64748b;margin-top:6px">PDF only. The document is securely backed up in Supabase Storage and linked to this Purchase Tracking record.</div>
+            <div style="font-size:12px;color:#64748b;margin-top:6px">PDF only. The document is saved to Google Drive and linked to this Purchase Tracking record.</div>
             <div id="trackingPdfList" style="margin-top:10px"></div>
         </div>
 
@@ -3267,68 +3268,82 @@ function openTrackingModal(item=null){
         renderTrackingPdfs(item.id);
     } else {
         const list = document.getElementById('trackingPdfList');
-        if(list) list.innerHTML = '<div style="color:#94a3b8;font-size:12px">Save the tracking record first, then upload its PDF to Supabase Storage.</div>';
+        if(list) list.innerHTML = '<div style="color:#94a3b8;font-size:12px">Save the tracking record first, then upload its PDF.</div>';
     }
 }
 
-async function saveTracking(){
+function saveTracking(){
 
     if(!f('f_tsupplier')){
+
         alert('Enter supplier name');
+
         return;
     }
 
     if(!f('f_tinvoice')){
+
         alert('Enter invoice number');
+
         return;
     }
 
     if(!f('f_tpo')){
+
         alert('Enter PO number');
+
         return;
     }
 
     let x = {
+
         id: editing || id('PTR'),
+
         supplier: f('f_tsupplier'),
+
         invoice: f('f_tinvoice'),
-        amount: Number(f('f_tamount') || 0),
+
+        amount: Number(
+            f('f_tamount') || 0
+        ),
+
         reference: f('f_treference'),
+
         po: f('f_tpo'),
+
         material: f('f_tmaterial'),
+
         remarks: f('f_tremarks')
+
     };
 
     if(editing){
+
         db.tracking = db.tracking.map(
             a => a.id === editing ? x : a
         );
+
     }else{
+
         db.tracking.push(x);
+
     }
 
+    save();
+
     const fileInput = document.getElementById('trackingPdfFile');
-    const selectedFile =
-        fileInput && fileInput.files && fileInput.files[0]
-            ? fileInput.files[0]
-            : null;
-
-    try{
-        if(selectedFile){
-            await saveTrackingPdf(x.id,selectedFile);
-        }
-
-        save();
+    if(fileInput && fileInput.files && fileInput.files[0]){
+        saveTrackingPdf(x.id, fileInput.files[0]).then(()=>{
+            closeModal();
+            renderTracking();
+        }).catch(err=>{
+            alert('PDF save failed: ' + err.message);
+            closeModal();
+            renderTracking();
+        });
+    } else {
         closeModal();
         renderTracking();
-
-        if(selectedFile){
-            alert('Purchase Tracking saved and PDF backed up to Supabase Storage successfully.');
-        }
-
-    }catch(error){
-        alert('PDF cloud backup failed: ' + (error.message || error) + '\n\nThe Purchase Tracking record was not saved.');
-        return;
     }
 }
 
@@ -3479,246 +3494,319 @@ function renderTracking(){
 }
 /* =========================
    PURCHASE TRACKING PDF STORAGE
-   Supabase Storage cloud backup.
-   Bucket: purchase-documents
+   Google Drive storage. Existing ProcureX UI is unchanged.
+   Uses Google Identity Services with the public Web Client ID.
+   No OAuth client secret is stored in this HTML file.
 ========================= */
+const GOOGLE_CLIENT_ID = '1096029261441-4ngvvk64t83kp2khd2el69mc48b2f229.apps.googleusercontent.com';
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const GOOGLE_DRIVE_FOLDER_NAME = 'ProcureX ERP';
+const GOOGLE_DRIVE_FOLDER_KEY = 'procurex_google_drive_folder_id_v1';
 
-const TRACKING_PDF_BUCKET = 'purchase-documents';
+let googleTokenClient = null;
+let googleAccessToken = null;
+let googleDriveReadyPromise = null;
 
-function trackingPdfSafeName(name){
-    return String(name || 'document.pdf')
-        .replace(/[^\w.\-() ]+/g,'_')
-        .replace(/\s+/g,'_')
-        .slice(0,180);
+function waitForGoogleGIS(){
+    if(googleDriveReadyPromise) return googleDriveReadyPromise;
+
+    googleDriveReadyPromise = new Promise((resolve,reject)=>{
+        const started = Date.now();
+        const timer = setInterval(()=>{
+            if(window.google && google.accounts && google.accounts.oauth2){
+                clearInterval(timer);
+                try{
+                    googleTokenClient = google.accounts.oauth2.initTokenClient({
+                        client_id: GOOGLE_CLIENT_ID,
+                        scope: GOOGLE_DRIVE_SCOPE,
+                        callback: (response)=>{
+                            if(response && response.access_token){
+                                googleAccessToken = response.access_token;
+                            }
+                        },
+                        error_callback: (error)=>{
+                            console.error('Google OAuth error:', error);
+                        }
+                    });
+                    resolve();
+                }catch(error){
+                    reject(error);
+                }
+                return;
+            }
+            if(Date.now()-started > 15000){
+                clearInterval(timer);
+                reject(new Error('Google sign-in library did not load. Please run ProcureX ERP from http://localhost:5500 and reload the page.'));
+            }
+        },100);
+    });
+
+    return googleDriveReadyPromise;
 }
 
-function trackingPdfPath(trackingId,fileName){
-    return String(trackingId) + '/' +
-        Date.now() + '_' +
-        Math.random().toString(36).slice(2,8) + '_' +
-        trackingPdfSafeName(fileName);
+function requestGoogleAccessToken(){
+    return new Promise(async (resolve,reject)=>{
+        try{
+            await waitForGoogleGIS();
+            if(!googleTokenClient) throw new Error('Google OAuth is not ready.');
+
+            googleTokenClient.callback = (response)=>{
+                if(response && response.access_token){
+                    googleAccessToken = response.access_token;
+                    resolve(response.access_token);
+                }else{
+                    reject(new Error('Google authorization was not completed.'));
+                }
+            };
+
+            googleTokenClient.error_callback = (error)=>{
+                console.error('Google OAuth error:',error);
+                reject(new Error('Google authorization failed or was cancelled.'));
+            };
+
+            googleTokenClient.requestAccessToken({
+                prompt: googleAccessToken ? '' : 'consent'
+            });
+        }catch(error){
+            reject(error);
+        }
+    });
+}
+
+async function getGoogleDriveToken(){
+    if(googleAccessToken) return googleAccessToken;
+    return await requestGoogleAccessToken();
+}
+
+async function googleDriveFetch(url,options={}){
+    let token = await getGoogleDriveToken();
+    let response = await fetch(url,{
+        ...options,
+        headers:{
+            ...(options.headers||{}),
+            Authorization:'Bearer '+token
+        }
+    });
+
+    if(response.status === 401){
+        googleAccessToken = null;
+        token = await requestGoogleAccessToken();
+        response = await fetch(url,{
+            ...options,
+            headers:{
+                ...(options.headers||{}),
+                Authorization:'Bearer '+token
+            }
+        });
+    }
+
+    return response;
+}
+
+async function ensureProcureXDriveFolder(){
+    const savedFolderId = localStorage.getItem(GOOGLE_DRIVE_FOLDER_KEY);
+    if(savedFolderId) return savedFolderId;
+
+    const q = encodeURIComponent(
+        "name='"+GOOGLE_DRIVE_FOLDER_NAME.replace(/'/g,"\\'")+"' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    );
+
+    const listResponse = await googleDriveFetch(
+        'https://www.googleapis.com/drive/v3/files?q='+q+'&spaces=drive&fields=files(id,name)&pageSize=10'
+    );
+
+    if(!listResponse.ok){
+        const text = await listResponse.text();
+        throw new Error('Unable to access Google Drive folder: '+text);
+    }
+
+    const listed = await listResponse.json();
+    if(listed.files && listed.files.length){
+        localStorage.setItem(GOOGLE_DRIVE_FOLDER_KEY,listed.files[0].id);
+        return listed.files[0].id;
+    }
+
+    const createResponse = await googleDriveFetch(
+        'https://www.googleapis.com/drive/v3/files?fields=id,name',
+        {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                name:GOOGLE_DRIVE_FOLDER_NAME,
+                mimeType:'application/vnd.google-apps.folder'
+            })
+        }
+    );
+
+    if(!createResponse.ok){
+        const text = await createResponse.text();
+        throw new Error('Unable to create Google Drive folder: '+text);
+    }
+
+    const folder = await createResponse.json();
+    localStorage.setItem(GOOGLE_DRIVE_FOLDER_KEY,folder.id);
+    return folder.id;
+}
+
+function makeMultipartBody(metadata,file){
+    const boundary = '-------procurex-'+Date.now().toString(36);
+    const delimiter = '\r\n--'+boundary+'\r\n';
+    const close = '\r\n--'+boundary+'--';
+    const encoder = new TextEncoder();
+    const metaBytes = encoder.encode(JSON.stringify(metadata));
+    const fileBytes = new Uint8Array(file.size);
+    return file.arrayBuffer().then(buffer=>{
+        const bytes = new Uint8Array(buffer);
+        const prefix = encoder.encode(
+            delimiter+'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+        );
+        const fileHeader = encoder.encode(
+            delimiter+'Content-Type: application/pdf\r\n\r\n'
+        );
+        const suffix = encoder.encode(close);
+        const result = new Uint8Array(prefix.length+metaBytes.length+fileHeader.length+bytes.length+suffix.length);
+        let offset=0;
+        result.set(prefix,offset); offset+=prefix.length;
+        result.set(metaBytes,offset); offset+=metaBytes.length;
+        result.set(fileHeader,offset); offset+=fileHeader.length;
+        result.set(bytes,offset); offset+=bytes.length;
+        result.set(suffix,offset);
+        return {body:result,boundary};
+    });
 }
 
 async function saveTrackingPdf(trackingId,file){
-    if(!file || file.type!=='application/pdf'){
+    if(!file || (file.type!=='application/pdf' && !/\.pdf$/i.test(file.name||''))){
         throw new Error('Please select a PDF file only.');
     }
-
     if(file.size>25*1024*1024){
         throw new Error('PDF must be 25 MB or smaller.');
     }
 
-    if(!cloudReady || !supabaseClient){
-        throw new Error('Supabase Storage is not connected. Please reload the ERP and try again.');
+    const folderId = await ensureProcureXDriveFolder();
+    const multipart = await makeMultipartBody({
+        name:file.name,
+        mimeType:'application/pdf',
+        parents:[folderId],
+        appProperties:{
+            procurex:'ERP',
+            procurexTrackingId:String(trackingId)
+        }
+    },file);
+
+    const response = await googleDriveFetch(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size,webViewLink,webContentLink,createdTime',
+        {
+            method:'POST',
+            headers:{
+                'Content-Type':'multipart/related; boundary='+multipart.boundary
+            },
+            body:multipart.body
+        }
+    );
+
+    if(!response.ok){
+        const text = await response.text();
+        throw new Error('Google Drive upload failed: '+text);
     }
 
-    const path = trackingPdfPath(trackingId,file.name);
-
-    const { error } = await supabaseClient
-        .storage
-        .from(TRACKING_PDF_BUCKET)
-        .upload(path,file,{
-            cacheControl:'3600',
-            contentType:'application/pdf',
-            upsert:false
-        });
-
-    if(error) throw error;
-
-    return {
-        id:path,
-        trackingId:trackingId,
-        name:file.name,
-        size:file.size,
-        type:'application/pdf',
-        path:path,
-        uploadedAt:new Date().toISOString()
-    };
+    return await response.json();
 }
 
 async function getTrackingPdfs(trackingId){
-    if(!cloudReady || !supabaseClient) return [];
+    const q = encodeURIComponent(
+        "trashed=false and '"+await ensureProcureXDriveFolder()+"' in parents and appProperties has { key='procurexTrackingId' and value='"+String(trackingId).replace(/'/g,"\\'")+"' }"
+    );
 
-    const { data, error } = await supabaseClient
-        .storage
-        .from(TRACKING_PDF_BUCKET)
-        .list(String(trackingId),{
-            limit:100,
-            sortBy:{column:'created_at',order:'desc'}
-        });
+    const response = await googleDriveFetch(
+        'https://www.googleapis.com/drive/v3/files?q='+q+'&spaces=drive&orderBy=createdTime desc&fields=files(id,name,mimeType,size,webViewLink,webContentLink,createdTime,appProperties)&pageSize=100'
+    );
 
-    if(error) throw error;
-
-    return (data || [])
-        .filter(x => x && x.name && !x.name.endsWith('/'))
-        .map(x => ({
-            id:String(trackingId) + '/' + x.name,
-            trackingId:String(trackingId),
-            name:x.name.replace(/^\d+_[a-z0-9]+_/i,''),
-            size:Number(x.metadata?.size || 0),
-            type:'application/pdf',
-            path:String(trackingId) + '/' + x.name,
-            uploadedAt:x.created_at || x.updated_at || ''
-        }));
-}
-
-async function deleteTrackingPdf(path){
-    if(!confirm('Delete this PDF from cloud storage?')) return;
-
-    if(!cloudReady || !supabaseClient){
-        return alert('Supabase Storage is not connected.');
+    if(!response.ok){
+        const text = await response.text();
+        throw new Error('Unable to read Google Drive PDFs: '+text);
     }
 
-    const { error } = await supabaseClient
-        .storage
-        .from(TRACKING_PDF_BUCKET)
-        .remove([path]);
+    const data = await response.json();
+    return (data.files||[]).map(f=>({
+        id:f.id,
+        name:f.name,
+        size:Number(f.size||0),
+        type:f.mimeType||'application/pdf',
+        webViewLink:f.webViewLink || ('https://drive.google.com/file/d/'+f.id+'/view'),
+        webContentLink:f.webContentLink || '',
+        uploadedAt:f.createdTime || ''
+    }));
+}
 
-    if(error){
-        alert('PDF delete failed: ' + (error.message || error));
-        return;
+async function deleteTrackingPdf(id){
+    if(!confirm('Delete this PDF from Google Drive?')) return;
+
+    const response = await googleDriveFetch(
+        'https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(id),
+        {method:'DELETE'}
+    );
+
+    if(!response.ok && response.status!==204){
+        const text = await response.text();
+        throw new Error('Google Drive delete failed: '+text);
     }
 
     const current=document.getElementById('trackingPdfList')?.dataset?.trackingId;
     if(current) await renderTrackingPdfs(current);
 }
 
-async function trackingPdfSignedUrl(path){
-    if(!cloudReady || !supabaseClient){
-        throw new Error('Supabase Storage is not connected.');
+async function downloadTrackingPdf(id){
+    const response = await googleDriveFetch(
+        'https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(id)+'?alt=media'
+    );
+
+    if(!response.ok){
+        const text = await response.text();
+        throw new Error('Google Drive download failed: '+text);
     }
 
-    const { data, error } = await supabaseClient
-        .storage
-        .from(TRACKING_PDF_BUCKET)
-        .createSignedUrl(path,3600);
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    let filename = 'ProcureX_Purchase_Tracking.pdf';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    if(match) filename = match[1];
 
-    if(error) throw error;
-    if(!data?.signedUrl) throw new Error('Unable to create PDF access link.');
-
-    return data.signedUrl;
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 
-async function downloadTrackingPdf(path){
-    try{
-        const url=await trackingPdfSignedUrl(path);
-        const response=await fetch(url);
-        if(!response.ok) throw new Error('Unable to download PDF.');
-
-        const blob=await response.blob();
-        const fileName=String(path).split('/').pop()
-            .replace(/^\d+_[a-z0-9]+_/i,'');
-
-        const objectUrl=URL.createObjectURL(blob);
-        const a=document.createElement('a');
-        a.href=objectUrl;
-        a.download=fileName || 'tracking-document.pdf';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(()=>URL.revokeObjectURL(objectUrl),1500);
-    }catch(error){
-        alert('PDF download failed: ' + (error.message || error));
+async function viewTrackingPdf(id){
+    const files = await getAllDrivePdfMetadataForTracking(id);
+    if(files.length){
+        window.open(files[0].webViewLink,'_blank');
+        return;
     }
+
+    window.open('https://drive.google.com/file/d/'+encodeURIComponent(id)+'/view','_blank');
 }
 
-async function viewTrackingPdf(path){
-    try{
-        const url=await trackingPdfSignedUrl(path);
-        window.open(url,'_blank');
-    }catch(error){
-        alert('PDF view failed: ' + (error.message || error));
-    }
+async function getAllDrivePdfMetadataForTracking(trackingId){
+    return await getTrackingPdfs(trackingId);
 }
 
 async function renderTrackingPdfs(trackingId){
     const list=document.getElementById('trackingPdfList');
     if(!list) return;
-
     list.dataset.trackingId=trackingId;
 
     try{
         const files=await getTrackingPdfs(trackingId);
-
-        list.innerHTML=files.length
-            ? files.map(f=>`
-                <div style="display:flex;align-items:center;gap:8px;padding:8px;border:1px solid #e2e8f0;border-radius:8px;margin-top:6px;background:#f8fafc">
-                    <span style="flex:1">
-                        📄 <b>${esc(f.name)}</b>
-                        <span style="font-size:11px;color:#64748b;margin-left:8px">
-                            ${f.size ? (f.size/1024/1024).toFixed(2)+' MB' : ''}
-                        </span>
-                    </span>
-                    <button class="btn small" onclick="viewTrackingPdf('${String(f.path).replace(/'/g,'&#039;')}')">View</button>
-                    <button class="btn small" onclick="downloadTrackingPdf('${String(f.path).replace(/'/g,'&#039;')}')">Download</button>
-                    <button class="btn small danger" onclick="deleteTrackingPdf('${String(f.path).replace(/'/g,'&#039;')}')">Delete</button>
-                </div>
-            `).join('')
-            : '<div style="color:#94a3b8;font-size:12px">No PDF uploaded for this tracking record.</div>';
-
+        list.innerHTML=files.length?files.map(f=>`<div style="display:flex;align-items:center;gap:8px;padding:8px;border:1px solid #e2e8f0;border-radius:8px;margin-top:6px;background:#f8fafc"><span style="flex:1">📄 <b>${esc(f.name)}</b><span style="font-size:11px;color:#64748b;margin-left:8px">${(f.size/1024/1024).toFixed(2)} MB</span></span><button class="btn small" onclick="window.open('${f.webViewLink}','_blank')">View</button><button class="btn small" onclick="downloadTrackingPdf('${f.id}')">Download</button><button class="btn small danger" onclick="deleteTrackingPdf('${f.id}')">Delete</button></div>`).join(''):'<div style="color:#94a3b8;font-size:12px">No PDF uploaded for this tracking record.</div>';
     }catch(error){
-        list.innerHTML='<div style="color:#b91c1c;font-size:12px">Unable to load cloud PDFs: '+esc(error.message || error)+'</div>';
-    }
-}
-
-/*
-   Legacy IndexedDB migration.
-   Existing PDFs on this computer are copied to Supabase Storage once.
-   The old browser copy is left untouched as a safety backup.
-*/
-async function migrateLegacyTrackingPdfs(){
-    if(!cloudReady || !supabaseClient) return;
-
-    const migrationKey='ProcureXTrackingPDFCloudMigration_v1';
-    if(localStorage.getItem(migrationKey)==='done') return;
-
-    if(!window.indexedDB) return;
-
-    try{
-        const legacyDb=await new Promise((resolve,reject)=>{
-            const req=indexedDB.open('ProcureXTrackingPDFs',1);
-            req.onupgradeneeded=()=>{};
-            req.onsuccess=()=>resolve(req.result);
-            req.onerror=()=>reject(req.error);
-        });
-
-        if(!legacyDb.objectStoreNames.contains('files')){
-            legacyDb.close();
-            localStorage.setItem(migrationKey,'done');
-            return;
-        }
-
-        const records=await new Promise((resolve,reject)=>{
-            const tx=legacyDb.transaction('files','readonly');
-            const req=tx.objectStore('files').getAll();
-            req.onsuccess=()=>resolve(req.result || []);
-            req.onerror=()=>reject(req.error);
-        });
-
-        legacyDb.close();
-
-        let uploaded=0;
-
-        for(const rec of records){
-            if(!rec?.trackingId || !rec?.blob) continue;
-
-            const existing=await getTrackingPdfs(rec.trackingId);
-            const sameName=existing.some(x=>x.name===rec.name);
-
-            if(!sameName){
-                await saveTrackingPdf(rec.trackingId,rec.blob);
-                uploaded++;
-            }
-        }
-
-        localStorage.setItem(migrationKey,'done');
-
-        if(uploaded){
-            console.log('ProcureX: migrated '+uploaded+' legacy tracking PDF(s) to Supabase Storage.');
-        }
-
-    }catch(error){
-        console.warn('ProcureX: legacy PDF migration will retry later.',error);
+        console.error(error);
+        list.innerHTML='<div style="color:#b45309;font-size:12px">Google Drive authorization is required to view PDFs.</div>';
     }
 }
 
@@ -3728,13 +3816,14 @@ async function openTrackingPdfManager(trackingId=null){
         if(!first) return alert('First add a Purchase Tracking record.');
         trackingId=first.id;
     }
-
     const item=(db.tracking||[]).find(x=>x.id===trackingId);
     if(!item) return alert('Purchase Tracking record not found.');
-
     openTrackingModal(item);
 }
 
+/* =========================
+   PURCHASE ORDER
+========================= */
 /* =========================
    PURCHASE ORDER
 ========================= */
@@ -8916,13 +9005,6 @@ setTimeout(
 
     },
     100
-);
-
-setTimeout(
-    function(){
-        migrateLegacyTrackingPdfs();
-    },
-    1800
 );
 
 
